@@ -23,34 +23,93 @@ DEFAULT_NULL_STRINGS: Set[str] = {
 }
 
 
-def sanitize_raw_text(raw_text: str, strip_borders: bool = True) -> List[str]:
+def decode_file_bytes(raw_bytes: bytes) -> str:
     """
-    Cleans raw file text:
-    - Strips UTF-8 BOM (\ufeff)
-    - Normalizes non-breaking spaces (\u00a0)
-    - Optionally strips leading and trailing border pipes (|col1|col2| -> col1|col2)
+    Robust multi-encoding decoder for .txt, .csv, and .dat files.
+    Tries standard and Windows/legacy encodings automatically.
     """
-    # Remove BOM and normalize line breaks
+    encodings_to_try = [
+        "utf-8",
+        "utf-8-sig",
+        "utf-16",
+        "utf-16-le",
+        "cp1252",
+        "latin-1",
+        "iso-8859-1"
+    ]
+    for enc in encodings_to_try:
+        try:
+            return raw_bytes.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw_bytes.decode("latin-1", errors="replace")
+
+
+def is_table_divider_line(line: str) -> bool:
+    """
+    Detects ASCII or Markdown table divider lines often found in .txt files, e.g.:
+      |---|---|---|
+      |:---|:---:|---:|
+      +---+---+---+
+      ====================
+      --------------------
+    """
+    s = line.strip()
+    if not s:
+        return False
+    # If the line consists only of dashes, pluses, equals, colons, pipes, and whitespace
+    if re.fullmatch(r"^[|\+\=\:\-\s]+$", s):
+        # Must contain at least two divider symbols to avoid false positive on single pipe
+        if s.count("-") >= 2 or s.count("=") >= 2 or s.count("+") >= 2:
+            return True
+    return False
+
+
+def sanitize_raw_text(
+    raw_text: str,
+    strip_borders: bool = True,
+    skip_table_dividers: bool = True,
+    skip_comments: bool = True
+) -> List[str]:
+    """
+    Cleans raw text from .txt and .csv files:
+    - Normalizes linebreaks and non-breaking spaces
+    - Drops ASCII / Markdown table dividers (|---|---|)
+    - Skips comment lines (# or //)
+    - Strips leading and trailing boundary pipes (|col1|col2| -> col1|col2)
+    """
     text = raw_text.lstrip("\ufeff")
-    lines = [line.strip().replace("\u00a0", " ") for line in text.splitlines()]
-    lines = [line for line in lines if line]
+    raw_lines = [line.strip().replace("\u00a0", " ") for line in text.splitlines()]
 
-    if not lines or not strip_borders:
-        return lines
+    cleaned_lines = []
+    for line in raw_lines:
+        if not line:
+            continue
+        # Skip comment lines in .txt files
+        if skip_comments and (line.startswith("#") or line.startswith("//")):
+            continue
+        # Skip markdown / ASCII dividers (|---|---| or +---+---+)
+        if skip_table_dividers and is_table_divider_line(line):
+            continue
+        cleaned_lines.append(line)
 
-    # Check if lines consistently start and end with a single pipe (table border format)
-    starts_pipe = all(line.startswith("|") and not line.startswith("||") for line in lines[:20])
-    ends_pipe = all(line.endswith("|") and not line.endswith("||") for line in lines[:20])
-
-    if starts_pipe and ends_pipe:
-        cleaned_lines = []
-        for line in lines:
-            if line.startswith("|") and line.endswith("|"):
-                line = line[1:-1].strip()
-            cleaned_lines.append(line)
+    if not cleaned_lines or not strip_borders:
         return cleaned_lines
 
-    return lines
+    # Check if lines consistently start and end with boundary pipes
+    sample = cleaned_lines[:20]
+    starts_pipe = all(l.startswith("|") and not l.startswith("||") for l in sample)
+    ends_pipe = all(l.endswith("|") and not l.endswith("||") for l in sample)
+
+    if starts_pipe and ends_pipe:
+        result = []
+        for l in cleaned_lines:
+            if l.startswith("|") and l.endswith("|"):
+                l = l[1:-1].strip()
+            result.append(l)
+        return result
+
+    return cleaned_lines
 
 
 def parse_delimited_file(
@@ -60,20 +119,17 @@ def parse_delimited_file(
     has_header: bool = True,
     handle_space_pipes: bool = True,
     strip_borders: bool = True,
+    skip_table_dividers: bool = True,
     null_strings: Optional[Set[str]] = None
 ) -> pd.DataFrame:
     """
-    Parses files with single (|), double (||), and space-separated (|   |) pipe delimiters.
-
-    Modes:
-      - 'smart_pipe_empty': Standard pipe '|' delimiter.
-                            Both '||' and '|   |' are correctly treated as EMPTY / NULL cells.
-      - 'mixed_delimiters_with_empty': Double pipe '||' is a column delimiter,
-                                      BUT '|   |' (pipes with 1+ spaces) is treated as an empty cell.
-      - 'strict_double_pipe': '||' is the only delimiter. '|| ||' or '||||' are empty cells.
-      - 'custom_regex': Custom regex pattern.
+    Parses .txt, .csv, and other delimited text files.
     """
-    lines = sanitize_raw_text(file_content, strip_borders=strip_borders)
+    lines = sanitize_raw_text(
+        file_content,
+        strip_borders=strip_borders,
+        skip_table_dividers=skip_table_dividers
+    )
     if not lines:
         return pd.DataFrame()
 
@@ -81,7 +137,6 @@ def parse_delimited_file(
     parsed_rows: List[List[Any]] = []
 
     if delimiter_mode == "smart_pipe_empty":
-        # Split on single pipe '|'. Handles quotes like "value with | inside"
         for line in lines:
             try:
                 reader = csv.reader([line], delimiter="|", quotechar='"', skipinitialspace=False)
@@ -91,45 +146,25 @@ def parse_delimited_file(
             parsed_rows.append(row)
 
     elif delimiter_mode == "mixed_delimiters_with_empty":
-        # If '|   |' exists, mark it as an explicit empty token before splitting
         for line in lines:
             if handle_space_pipes:
-                # Replace '|   |' (1 or more spaces between pipes) with an empty field marker
+                # Replace '|   |' with explicit empty marker
                 line = re.sub(r"\|[ \t]+\|", "||__EMPTY_FIELD__||", line)
             
-            # Split by double pipe '||' or single pipe '|'
             tokens = re.split(r"\|\||\|", line)
-            cleaned_tokens = [
-                "" if t == "__EMPTY_FIELD__" else t
-                for t in tokens
-            ]
+            cleaned_tokens = ["" if t == "__EMPTY_FIELD__" else t for t in tokens]
             parsed_rows.append(cleaned_tokens)
 
     elif delimiter_mode == "strict_double_pipe":
-        # Multi-char double pipe '||'
         for line in lines:
-            try:
-                reader = csv.reader([line], delimiter="|", quotechar='"')
-                # Fallback to python split on '||'
-                row = line.split("||")
-            except Exception:
-                row = line.split("||")
-            parsed_rows.append(row)
+            parsed_rows.append(line.split("||"))
 
     elif delimiter_mode == "custom_regex":
         pattern = re.compile(custom_regex)
         for line in lines:
             parsed_rows.append(pattern.split(line))
 
-    else:
-        # Default fallback
-        for line in lines:
-            parsed_rows.append(line.split("|"))
-
-    if not parsed_rows:
-        return pd.DataFrame()
-
-    # Step 2: Clean each cell (strip whitespace, detect |   | and null strings)
+    # Clean each cell
     cleaned_rows = []
     for row in parsed_rows:
         cleaned_row = []
@@ -138,23 +173,21 @@ def parse_delimited_file(
                 cleaned_row.append(pd.NA)
                 continue
             c_str = str(cell).strip()
-            # If the cell is empty or matches null representations (NULL, N/A, -, etc.)
             if c_str.lower() in null_set:
                 cleaned_row.append(pd.NA)
             else:
                 cleaned_row.append(c_str)
         cleaned_rows.append(cleaned_row)
 
-    # Step 3: Normalize row lengths (handle ragged/inconsistent rows)
+    # Normalize row lengths
     max_cols = max(len(row) for row in cleaned_rows)
     normalized_rows = [row + [pd.NA] * (max_cols - len(row)) for row in cleaned_rows]
 
-    # Step 4: Extract headers
+    # Handle headers
     if has_header and len(normalized_rows) > 0:
-        raw_headers = normalized_rows[0]
         headers = []
         seen = {}
-        for i, h in enumerate(raw_headers):
+        for i, h in enumerate(normalized_rows[0]):
             h_clean = str(h).strip() if pd.notna(h) and str(h).strip() else f"Column_{i+1}"
             if h_clean in seen:
                 seen[h_clean] += 1
@@ -177,11 +210,10 @@ def format_dataframe(
     null_fill_value: str = ""
 ) -> pd.DataFrame:
     """
-    Applies column formatting and replaces NA/Null with desired export representation.
+    Applies column formatting and fills missing/null values based on user choice.
     """
     cleaned_df = df.copy()
 
-    # Clean column headers
     if clean_column_names:
         cleaned_df.columns = [
             re.sub(r"\s+", "_", re.sub(r"[^\w\s]", "", str(col))).strip()
@@ -194,7 +226,6 @@ def format_dataframe(
         rule = column_rules.get(col, {}) if column_rules else {}
         col_type = rule.get("type", "text")
 
-        # Strip spaces and standardize nulls
         cleaned_df[col] = cleaned_df[col].apply(
             lambda x: pd.NA if (pd.isna(x) or str(x).strip().lower() in DEFAULT_NULL_STRINGS) else str(x).strip()
         )
@@ -211,13 +242,9 @@ def format_dataframe(
             prefix = rule.get("currency_symbol", "") if col_type == "currency" else ""
 
             if decimals == 0:
-                cleaned_df[col] = numeric_vals.apply(
-                    lambda x: f"{prefix}{int(x):,}" if pd.notnull(x) else pd.NA
-                )
+                cleaned_df[col] = numeric_vals.apply(lambda x: f"{prefix}{int(x):,}" if pd.notnull(x) else pd.NA)
             else:
-                cleaned_df[col] = numeric_vals.apply(
-                    lambda x: f"{prefix}{x:,.{decimals}f}" if pd.notnull(x) else pd.NA
-                )
+                cleaned_df[col] = numeric_vals.apply(lambda x: f"{prefix}{x:,.{decimals}f}" if pd.notnull(x) else pd.NA)
 
         elif col_type == "id":
             pad = rule.get("id_pad_zeros", 0)
@@ -236,7 +263,6 @@ def format_dataframe(
             elif case == "title":
                 cleaned_df[col] = cleaned_df[col].apply(lambda x: str(x).title() if pd.notna(x) else pd.NA)
 
-        # Rename column
         new_name = rule.get("new_name")
         if new_name and new_name.strip():
             rename_mapping[col] = new_name.strip()
@@ -244,7 +270,6 @@ def format_dataframe(
     if rename_mapping:
         cleaned_df = cleaned_df.rename(columns=rename_mapping)
 
-    # Final replacement for pd.NA based on export choice
     cleaned_df = cleaned_df.fillna(null_fill_value)
 
     return cleaned_df
