@@ -2,7 +2,7 @@ import io
 import re
 import pandas as pd
 import streamlit as st
-from formatter import parse_delimited_file, format_dataframe
+from formatter import parse_delimited_file, format_dataframe, DEFAULT_NULL_STRINGS
 
 # Page Configuration
 st.set_page_config(
@@ -32,58 +32,81 @@ st.markdown("""
         padding: 12px;
         border-radius: 8px;
     }
-    .badge-info {
-        background-color: #EFF6FF;
-        color: #1D4ED8;
-        padding: 4px 8px;
-        border-radius: 4px;
-        font-size: 0.85rem;
-    }
 </style>
 """, unsafe_allow_html=True)
 
-# Sample Data Generator for Demo
-DEMO_CSV = """EMP_ID||FULL_NAME|JOIN_DATE||SALARY||CITY|PHONE
-101||john doe|2023/04/15||75000.5||new york|1234567890
-102||JANE SMITH|15-05-2022||89200.0||san francisco|9876543210
-103||robert brown|2021-12-01||62400||chicago||3456789012
-104||EMILY DAVIS|01/20/2024||95000.75||seattle|4567890123
-105||william wilson|2022-08-10||51000||boston|5678901234"""
+# Sample Data Generator for Demo showcasing all edge cases:
+# - || (consecutive pipes)
+# - |   | (pipes with spaces)
+# - Leading / trailing border pipes
+# - Text null representations like NULL, N/A, None, -
+DEMO_CSV = """| EMP_ID | FULL_NAME | JOIN_DATE | SALARY | CITY | NOTES |
+| 101 | john doe | 2023/04/15 | 75000.5 | new york | active |
+| 102 | JANE SMITH | 15-05-2022 | 89200.0 |   | NULL |
+| 103 | robert brown | 2021-12-01 | | chicago | N/A |
+| 104 | | 01/20/2024 | 95000.75 | seattle | None |
+| 105 | william wilson | | 51000 | - | |"""
 
 # Sidebar - Configuration
 with st.sidebar:
-    st.header("⚙️ Delimiter & Parse Settings")
+    st.header("⚙️ Delimiter & Parsing Rules")
 
     delimiter_choice = st.selectbox(
-        "Delimiter Mode",
+        "Delimiter Strategy",
         options=[
-            ("Smart Mixed (| and || as splitters)", "smart_mixed"),
-            ("Standard Pipe | (|| is empty field)", "pipe_with_empty"),
-            ("Double Pipe || strictly (| is text)", "double_pipe"),
+            ("Smart Pipe: Handles | , || , and |   |", "smart_pipe_empty"),
+            ("Mixed Delimiters: || and | with |   | empty", "mixed_delimiters_with_empty"),
+            ("Strict Double Pipe: || only", "strict_double_pipe"),
             ("Custom Regex", "custom_regex")
         ],
         format_func=lambda x: x[0],
         index=0,
-        help="Choose how the engine splits lines containing single and double pipes."
+        help="Select how consecutive pipes and space-separated pipes should be parsed."
     )[1]
 
     custom_regex = r"\|{1,2}"
     if delimiter_choice == "custom_regex":
         custom_regex = st.text_input("Enter Delimiter Regex", value=r"\|{1,2}")
 
-    has_header = st.checkbox("First row contains headers", value=True)
-    clean_col_names = st.checkbox("Standardize column names (snake_case/no spaces)", value=True)
-    
-    st.divider()
-    st.subheader("💡 Need Help?")
-    st.caption(
-        "Upload any text/CSV file with pipe delimiters. "
-        "The app parses, transforms each column based on its name/rules, and gives you clean CSV/Excel output."
+    st.subheader("🧹 Edge Case Handlers")
+    handle_space_pipes = st.checkbox(
+        "Treat '|   |' (pipes with spaces) as Empty/Null",
+        value=True,
+        help="Converts cells containing only whitespace between pipes into null/empty values."
     )
+    
+    clean_null_strings = st.checkbox(
+        "Treat text 'NULL', 'None', 'N/A', '-' as Null",
+        value=True,
+        help="Recognizes placeholder text like NULL, None, N/A, and dashes as true missing values."
+    )
+
+    strip_borders = st.checkbox(
+        "Strip boundary pipes (|...| table style)",
+        value=True,
+        help="Removes leading and trailing pipes so they don't produce empty phantom columns."
+    )
+
+    has_header = st.checkbox("First row contains headers", value=True)
+    clean_col_names = st.checkbox("Standardize column names (snake_case)", value=True)
+
+    st.divider()
+    st.subheader("📤 Output Preferences")
+    null_fill_choice = st.selectbox(
+        "Display/Export Nulls as:",
+        options=[
+            ('Empty space ("")', ""),
+            ('Text "NULL"', "NULL"),
+            ('Text "NA"', "NA"),
+            ('Dash ("-")', "-")
+        ],
+        format_func=lambda x: x[0],
+        index=0
+    )[1]
 
 # Main Header
 st.markdown('<div class="main-header">📊 Delimited File Cleaner & Formatter</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Easily parse files with mixed <code>|</code> and <code>||</code> delimiters and format columns.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Handles <code>|</code>, <code>||</code>, <code>|   |</code> (spaced pipes), NULL text representations, and column formatting.</div>', unsafe_allow_html=True)
 
 # File Input Section
 col_upload, col_demo = st.columns([3, 1])
@@ -92,11 +115,11 @@ with col_upload:
     uploaded_file = st.file_uploader(
         "Upload CSV or Delimited Text File",
         type=["csv", "txt", "tsv", "dat"],
-        help="Upload files delimited with | or ||"
+        help="Upload files delimited with |, ||, or |   |"
     )
 
 with col_demo:
-    st.write("Or try sample data:")
+    st.write("Or try sample edge-case data:")
     use_demo = st.button("Load Demo File", use_container_width=True)
 
 # Determine file content
@@ -108,7 +131,7 @@ if uploaded_file is not None:
         file_content = uploaded_file.getvalue().decode("latin-1")
 elif use_demo:
     file_content = DEMO_CSV
-    st.info("Loaded sample demo dataset.")
+    st.info("Loaded sample dataset with mixed pipes, spaces, and NULL placeholders.")
 
 if not file_content:
     st.info("👆 Please upload a file or click **'Load Demo File'** to begin.")
@@ -120,7 +143,10 @@ try:
         file_content=file_content,
         delimiter_mode=delimiter_choice,
         custom_regex=custom_regex,
-        has_header=has_header
+        has_header=has_header,
+        handle_space_pipes=handle_space_pipes,
+        strip_borders=strip_borders,
+        null_strings=DEFAULT_NULL_STRINGS if clean_null_strings else set()
     )
 except Exception as e:
     st.error(f"Error parsing file: {e}")
@@ -134,7 +160,7 @@ if df_raw.empty:
 metric_cols = st.columns(4)
 metric_cols[0].metric("Total Rows", f"{len(df_raw):,}")
 metric_cols[1].metric("Total Columns", f"{len(df_raw.columns):,}")
-metric_cols[2].metric("Empty Cells", f"{df_raw.isna().sum().sum():,}")
+metric_cols[2].metric("Empty / Null Cells", f"{df_raw.isna().sum().sum():,}")
 metric_cols[3].metric("Delimiter Mode", delimiter_choice)
 
 st.write("---")
@@ -147,7 +173,6 @@ with st.expander("Click to Configure Column Rules", expanded=True):
     col_rules = {}
     cols_to_keep = []
 
-    # Display columns in a responsive grid
     for col in df_raw.columns:
         col_lower = str(col).lower()
         
@@ -213,7 +238,7 @@ with st.expander("Click to Configure Column Rules", expanded=True):
                     symbol = st.text_input("Currency Symbol", value=default_symbol, key=f"sym_{col}")
                     rule_options["currency_symbol"] = symbol
             elif selected_type == "id":
-                pad_len = st.number_input("Pad with zeros to length (0 = no pad)", min_value=0, max_value=20, value=default_pad, key=f"pad_{col}")
+                pad_len = st.number_input("Pad zeros to length (0 = no pad)", min_value=0, max_value=20, value=default_pad, key=f"pad_{col}")
                 rule_options["id_pad_zeros"] = int(pad_len)
 
         with c4:
@@ -224,19 +249,20 @@ with st.expander("Click to Configure Column Rules", expanded=True):
         col_rules[col] = rule_options
         st.write("---")
 
-# Filter DataFrame to kept columns
+# Filter DataFrame to selected columns
 df_selected = df_raw[cols_to_keep] if cols_to_keep else df_raw
 
-# Apply Formatting
+# Apply Formatting & Null replacements
 df_formatted = format_dataframe(
     df=df_selected,
     column_rules=col_rules,
-    clean_column_names=clean_col_names
+    clean_column_names=clean_col_names,
+    null_fill_value=null_fill_choice
 )
 
 # Tabs for Data Preview
 st.subheader("👁️ Preview Data")
-tab_clean, tab_raw, tab_stats = st.tabs(["✨ Formatted Output", "📄 Raw Parsed Data", "📈 Data Profile"])
+tab_clean, tab_raw, tab_stats = st.tabs(["✨ Formatted Output", "📄 Raw Parsed Data", "📈 Null & Data Profile"])
 
 with tab_clean:
     st.dataframe(df_formatted, use_container_width=True)
@@ -245,22 +271,21 @@ with tab_raw:
     st.dataframe(df_raw, use_container_width=True)
 
 with tab_stats:
-    st.write("Column non-null counts and unique values:")
     stats_df = pd.DataFrame({
-        "Column": df_formatted.columns,
-        "Non-Null Count": df_formatted.notnull().sum().values,
-        "Null Count": df_formatted.isnull().sum().values,
-        "Unique Values": df_formatted.nunique().values
+        "Column": df_raw.columns,
+        "Total Rows": len(df_raw),
+        "Null / Empty Count": df_raw.isna().sum().values,
+        "Fill Rate (%)": ((df_raw.notna().sum() / len(df_raw)) * 100).round(1).values
     })
     st.dataframe(stats_df, use_container_width=True)
 
 # Export Section
-st.subheader("📥 Download Formatted File")
-export_col1, export_col2, export_col3 = st.columns([1.5, 1.5, 3])
+st.subheader("📥 Download Clean File")
+export_col1, export_col2, _ = st.columns([1.5, 1.5, 3])
 
 with export_col1:
     out_delimiter = st.selectbox(
-        "Export CSV Delimiter",
+        "Export Delimiter",
         options=[("Comma (,)", ","), ("Pipe (|)", "|"), ("Tab (\\t)", "\t"), ("Semicolon (;)", ";")],
         format_func=lambda x: x[0],
         index=0
@@ -270,13 +295,12 @@ with export_col1:
     st.download_button(
         label="⬇️ Download Clean CSV",
         data=csv_bytes,
-        file_name="formatted_data.csv",
+        file_name="clean_formatted_data.csv",
         mime="text/csv",
         use_container_width=True
     )
 
 with export_col2:
-    # Excel output
     excel_buffer = io.BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
         df_formatted.to_excel(writer, index=False, sheet_name="Cleaned Data")
@@ -285,8 +309,7 @@ with export_col2:
     st.download_button(
         label="⬇️ Download Excel (.xlsx)",
         data=excel_bytes,
-        file_name="formatted_data.xlsx",
+        file_name="clean_formatted_data.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
-
