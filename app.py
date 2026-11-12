@@ -2,11 +2,11 @@ import io
 import re
 import pandas as pd
 import streamlit as st
-from formatter import parse_delimited_file, format_dataframe, DEFAULT_NULL_STRINGS
+from formatter import parse_delimited_file, format_dataframe, decode_file_bytes, DEFAULT_NULL_STRINGS
 
 # Page Configuration
 st.set_page_config(
-    page_title="Pipe Delimited File Cleaner & Formatter",
+    page_title="Delimited File Cleaner & Formatter",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -35,17 +35,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Sample Data Generator for Demo showcasing all edge cases:
-# - || (consecutive pipes)
-# - |   | (pipes with spaces)
-# - Leading / trailing border pipes
-# - Text null representations like NULL, N/A, None, -
-DEMO_CSV = """| EMP_ID | FULL_NAME | JOIN_DATE | SALARY | CITY | NOTES |
+# Sample Data for Text and CSV
+DEMO_TXT = """# Monthly Scrub Data Report
+# Export Source: Legacy Database System
+| EMP_ID | FULL_NAME | JOIN_DATE | SALARY | CITY | NOTES |
+|:-------|:----------|:----------|:-------|:-----|:------|
 | 101 | john doe | 2023/04/15 | 75000.5 | new york | active |
 | 102 | JANE SMITH | 15-05-2022 | 89200.0 |   | NULL |
 | 103 | robert brown | 2021-12-01 | | chicago | N/A |
 | 104 | | 01/20/2024 | 95000.75 | seattle | None |
-| 105 | william wilson | | 51000 | - | |"""
+| 105 | william wilson | | 51000 | - | |
+# End of report"""
 
 # Sidebar - Configuration
 with st.sidebar:
@@ -68,7 +68,7 @@ with st.sidebar:
     if delimiter_choice == "custom_regex":
         custom_regex = st.text_input("Enter Delimiter Regex", value=r"\|{1,2}")
 
-    st.subheader("🧹 Edge Case Handlers")
+    st.subheader("🧹 .TXT & CSV Cleaners")
     handle_space_pipes = st.checkbox(
         "Treat '|   |' (pipes with spaces) as Empty/Null",
         value=True,
@@ -76,15 +76,21 @@ with st.sidebar:
     )
     
     clean_null_strings = st.checkbox(
-        "Treat text 'NULL', 'None', 'N/A', '-' as Null",
+        "Treat 'NULL', 'None', 'N/A', '-' as Null",
         value=True,
         help="Recognizes placeholder text like NULL, None, N/A, and dashes as true missing values."
+    )
+
+    strip_dividers = st.checkbox(
+        "Ignore Table Dividers (|---|---| or +---+)",
+        value=True,
+        help="Filters out markdown/ASCII separator lines commonly found in .txt files."
     )
 
     strip_borders = st.checkbox(
         "Strip boundary pipes (|...| table style)",
         value=True,
-        help="Removes leading and trailing pipes so they don't produce empty phantom columns."
+        help="Removes leading and trailing boundary pipes so no phantom blank columns appear."
     )
 
     has_header = st.checkbox("First row contains headers", value=True)
@@ -106,35 +112,45 @@ with st.sidebar:
 
 # Main Header
 st.markdown('<div class="main-header">📊 Delimited File Cleaner & Formatter</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Handles <code>|</code>, <code>||</code>, <code>|   |</code> (spaced pipes), NULL text representations, and column formatting.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Clean and format <b>.txt</b>, <b>.csv</b>, and <b>.tsv</b> files with <code>|</code>, <code>||</code>, <code>|   |</code>, and table borders.</div>', unsafe_allow_html=True)
 
-# File Input Section
-col_upload, col_demo = st.columns([3, 1])
+# Input method selection: Upload vs Paste Text
+input_method = st.radio("Choose Input Method:", ["📁 Upload File (.txt, .csv, .tsv, .dat)", "📝 Paste Raw Text Directly"], horizontal=True)
 
-with col_upload:
-    uploaded_file = st.file_uploader(
-        "Upload CSV or Delimited Text File",
-        type=["csv", "txt", "tsv", "dat"],
-        help="Upload files delimited with |, ||, or |   |"
-    )
-
-with col_demo:
-    st.write("Or try sample edge-case data:")
-    use_demo = st.button("Load Demo File", use_container_width=True)
-
-# Determine file content
 file_content = None
-if uploaded_file is not None:
-    try:
-        file_content = uploaded_file.getvalue().decode("utf-8")
-    except UnicodeDecodeError:
-        file_content = uploaded_file.getvalue().decode("latin-1")
-elif use_demo:
-    file_content = DEMO_CSV
-    st.info("Loaded sample dataset with mixed pipes, spaces, and NULL placeholders.")
+
+if input_method == "📁 Upload File (.txt, .csv, .tsv, .dat)":
+    col_upload, col_demo = st.columns([3, 1])
+    with col_upload:
+        uploaded_file = st.file_uploader(
+            "Upload file (.txt, .csv, .tsv, .dat)",
+            type=["txt", "csv", "tsv", "dat", "log"],
+            help="Upload any delimited text or CSV file."
+        )
+    with col_demo:
+        st.write("Or try sample text file:")
+        use_demo = st.button("Load Demo .TXT File", use_container_width=True)
+
+    if uploaded_file is not None:
+        file_content = decode_file_bytes(uploaded_file.getvalue())
+    elif use_demo:
+        file_content = DEMO_TXT
+        st.info("Loaded sample .txt table report with comments and markdown dividers.")
+
+else:
+    # Direct paste text area
+    col_paste, col_paste_demo = st.columns([3, 1])
+    with col_paste_demo:
+        if st.button("Load Demo Text into Box"):
+            st.session_state["pasted_text_input"] = DEMO_TXT
+    
+    default_text = st.session_state.get("pasted_text_input", "")
+    pasted_text = st.text_area("Paste delimited text lines here:", value=default_text, height=220)
+    if pasted_text.strip():
+        file_content = pasted_text
 
 if not file_content:
-    st.info("👆 Please upload a file or click **'Load Demo File'** to begin.")
+    st.info("👆 Please upload a **.txt** or **.csv** file, or paste text above to begin.")
     st.stop()
 
 # Parse the raw content
@@ -146,6 +162,7 @@ try:
         has_header=has_header,
         handle_space_pipes=handle_space_pipes,
         strip_borders=strip_borders,
+        skip_table_dividers=strip_dividers,
         null_strings=DEFAULT_NULL_STRINGS if clean_null_strings else set()
     )
 except Exception as e:
@@ -153,7 +170,7 @@ except Exception as e:
     st.stop()
 
 if df_raw.empty:
-    st.warning("The parsed file is empty. Please check your file content and delimiter settings.")
+    st.warning("The parsed file is empty. Please verify your file contents and delimiter settings.")
     st.stop()
 
 # Overview Metrics
@@ -176,7 +193,7 @@ with st.expander("Click to Configure Column Rules", expanded=True):
     for col in df_raw.columns:
         col_lower = str(col).lower()
         
-        # Guess column type based on column name
+        # Smart guesses for types
         default_type = "text"
         default_date_fmt = "%Y-%m-%d"
         default_case = "none"
@@ -281,7 +298,7 @@ with tab_stats:
 
 # Export Section
 st.subheader("📥 Download Clean File")
-export_col1, export_col2, _ = st.columns([1.5, 1.5, 3])
+export_col1, export_col2, export_col3 = st.columns([1.5, 1.5, 1.5])
 
 with export_col1:
     out_delimiter = st.selectbox(
@@ -301,6 +318,16 @@ with export_col1:
     )
 
 with export_col2:
+    txt_bytes = df_formatted.to_csv(index=False, sep=out_delimiter).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download Clean .TXT",
+        data=txt_bytes,
+        file_name="clean_formatted_data.txt",
+        mime="text/plain",
+        use_container_width=True
+    )
+
+with export_col3:
     excel_buffer = io.BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
         df_formatted.to_excel(writer, index=False, sheet_name="Cleaned Data")
